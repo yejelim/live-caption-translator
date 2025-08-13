@@ -1,0 +1,1 @@
+# Whisper API 래퍼
