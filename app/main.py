@@ -1,14 +1,17 @@
 # app/main.py
+from dotenv import load_dotenv
+load_dotenv()
+
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query
 from fastapi.responses import PlainTextResponse, StreamingResponse
-from dotenv import load_dotenv
+
 import os
 from app.asr import transcribe_chunk
 from app.translate import translate_text
 from app.session import SESSION
 from app.exporters import build_docx
 
-load_dotenv()
+
 app = FastAPI(title="Live Caption Translator")
 
 @app.get("/health")
