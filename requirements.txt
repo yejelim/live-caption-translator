@@ -2,4 +2,4 @@ fastapi
 uvicorn[standard]
 python-dotenv
 openai>=1.40.0
-python-docx
+python-docx 
