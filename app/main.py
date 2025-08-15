@@ -97,6 +97,7 @@ async def ws_stream(websocket: WebSocket, session_id: str = Query("default")):
     pending = None  # {"seq","t0","t1","text_en"}
     buffer = CaptionBuffer(min_window_sec=8.0, max_window_sec=12.0, min_chars=20)
     prev_en_block = None  # (V2 대비: 바로 이전 KO 블록 EN)
+    timeline_pos = 0.0 # 청크들의 글로벌 시작 시간 명시 (초)
 
     try:
         while True:
@@ -109,6 +110,8 @@ async def ws_stream(websocket: WebSocket, session_id: str = Query("default")):
                 seg_t1 = asr["segments"][-1]["end"]
             else:
                 seg_t0 = seg_t1 = 0.0
+
+
 
             # ➊ 직전 pending을 final로 확정 + KO 버퍼 누적/번역
             if pending and pending["text_en"]:
@@ -130,13 +133,25 @@ async def ws_stream(websocket: WebSocket, session_id: str = Query("default")):
                         "text_ko": text_ko
                     })
                     prev_en_block = full_en  # (V2 대비)
+                
+                # 직전 청크 길이만큼 글로벌 타임라인을 전진
+                timeline_pos = pending["t1"]
+
+            # 직전 청크의 글로벌 끝으로 타임라인 전진
+            if pending:
+                timeline_pos = pending["t1"]
+
+            # 청크를 받아서 로컬 -> 글로벌 타임라인으로 맵핑
+            g_t0 = timeline_pos + seg_t0
+            g_t1 = timeline_pos + seg_t1
 
             # ➋ 현재 청크는 즉시 partial로 표시
-            cur = {"seq": seq, "t0": seg_t0, "t1": seg_t1, "text_en": text_en}
+            cur = {"seq": seq, "t0": g_t0, "t1": g_t1, "text_en": text_en, "local_t0": seg_t0, "local_t1": seg_t1}
             await websocket.send_json({
                 "type": "en_partial",
                 "seq": seq,
                 "t0": seg_t0, "t1": seg_t1,
+                "t0": g_t0, "t1": g_t1,  # 글로벌 타임라인 위치
                 "text_en": text_en
             })
             pending = cur
