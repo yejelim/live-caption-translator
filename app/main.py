@@ -3,6 +3,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import os
+import re
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query
 from fastapi.responses import PlainTextResponse, StreamingResponse, HTMLResponse
 
@@ -10,6 +11,21 @@ from app.asr import transcribe_chunk
 from app.translate import translate_text
 from app.session import SESSION
 from app.exporters import build_docx
+
+def clean_en(s: str) -> str:
+    if not s:
+        return s
+    s = re.sub(r"\s+", " ", s).strip() # 공백 정리
+    s = re.sub(r"\.{3,}$", ".", s) # 말미의 ... → .
+    # 너무 짧지 않고 끝에 문장부호 없으면 마침표 보정 
+    if len(s) > 40 and not re.search(r"[.!?]$", s):
+            s += "."
+    return s
+
+
+# 전송 직전 시간 표시 반올림 
+def r2(x: float) -> float:
+    return float(f"{x:.2f}")
 
 app = FastAPI(title="Live Caption Translator")
 
@@ -95,7 +111,7 @@ async def ws_stream(websocket: WebSocket, session_id: str = Query("default")):
 
     seq = 1
     pending = None  # {"seq","t0","t1","text_en"}
-    buffer = CaptionBuffer(min_window_sec=8.0, max_window_sec=12.0, min_chars=20)
+    buffer = CaptionBuffer(min_window_sec=10.0, max_window_sec=15.0, min_chars=25)
     prev_en_block = None  # (V2 대비: 바로 이전 KO 블록 EN)
     timeline_pos = 0.0 # 청크들의 글로벌 시작 시간 명시 (초)
 
@@ -103,7 +119,7 @@ async def ws_stream(websocket: WebSocket, session_id: str = Query("default")):
         while True:
             audio_bytes = await websocket.receive_bytes()
             asr = transcribe_chunk(audio_bytes)
-            text_en = (asr["text"] or "").strip()
+            text_en = clean_en((asr["text"] or "").strip())
 
             if asr["segments"]:
                 seg_t0 = asr["segments"][0]["start"]
@@ -151,7 +167,7 @@ async def ws_stream(websocket: WebSocket, session_id: str = Query("default")):
                 "type": "en_partial",
                 "seq": seq,
                 "t0": seg_t0, "t1": seg_t1,
-                "t0": g_t0, "t1": g_t1,  # 글로벌 타임라인 위치
+                "t0": r2(g_t0), "t1": r2(g_t1),  # 글로벌 타임라인 위치
                 "text_en": text_en
             })
             pending = cur
@@ -175,8 +191,8 @@ async def ws_stream(websocket: WebSocket, session_id: str = Query("default")):
             SESSION.append(session_id, ft0, ft1, full_en, text_ko)
             await websocket.send_json({
                 "type": "ko_batch",
-                "window": {"t0": ft0, "t1": ft1},
-                "text_en": full_en,
+                "window": {"t0": r2(ft0), "t1": r2(ft1)},
+                # "text_en": full_en,
                 "text_ko": text_ko
             })
         SESSION.end(session_id)
