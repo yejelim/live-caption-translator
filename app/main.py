@@ -4,31 +4,65 @@ load_dotenv()
 
 import os
 import re
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query
-from fastapi.responses import PlainTextResponse, StreamingResponse, HTMLResponse
+from pathlib import Path
+from datetime import datetime
+import uuid
+import shutil
+from io import BytesIO
+
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query, UploadFile, File, Form
+from fastapi.responses import PlainTextResponse, StreamingResponse, HTMLResponse, FileResponse
+from fastapi.middleware.cors import CORSMiddleware
 
 from app.asr import transcribe_chunk
 from app.translate import translate_text
 from app.session import SESSION
 from app.exporters import build_docx
 
+# ─────────────────────────────────────────────────────────────
+# FastAPI
+# ─────────────────────────────────────────────────────────────
+app = FastAPI(title="Live Caption Translator", version="0.1.0")
+
+# CORS: 개발에서 자주 쓰는 포트/도메인 허용
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+        "http://localhost:3001",
+        "http://127.0.0.1:3001",
+    ],
+    allow_origin_regex=r"http://localhost:\d+$",
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ─────────────────────────────────────────────────────────────
+# 유틸
+# ─────────────────────────────────────────────────────────────
 def clean_en(s: str) -> str:
     if not s:
         return s
-    s = re.sub(r"\s+", " ", s).strip() # 공백 정리
-    s = re.sub(r"\.{3,}$", ".", s) # 말미의 ... → .
-    # 너무 짧지 않고 끝에 문장부호 없으면 마침표 보정 
+    s = re.sub(r"\s+", " ", s).strip()
+    s = re.sub(r"\.{3,}$", ".", s)
     if len(s) > 40 and not re.search(r"[.!?]$", s):
-            s += "."
+        s += "."
     return s
 
-
-# 전송 직전 시간 표시 반올림 
 def r2(x: float) -> float:
     return float(f"{x:.2f}")
 
-app = FastAPI(title="Live Caption Translator")
+DATA_DIR = Path("data")
+(DATA_DIR / "sessions").mkdir(parents=True, exist_ok=True)
+(DATA_DIR / "exports").mkdir(parents=True, exist_ok=True)
 
+SESSION_TIMELINE = {}  # session_id -> float (HTTP 청크용 글로벌 타임라인)
+
+# ─────────────────────────────────────────────────────────────
+# 헬스/인덱스
+# ─────────────────────────────────────────────────────────────
 @app.get("/health")
 def health():
     return {"ok": True}
@@ -44,19 +78,19 @@ def index():
       <ul>
         <li>Health: <a href="/health">/health</a></li>
         <li>API Docs (Swagger): <a href="/docs">/docs</a></li>
-        <li>WebSocket: <code>ws://localhost:8080/ws/stream?session_id=demo</code></li>
-        <li>Export: <code>/export/&lt;session_id&gt;?format=txt|docx|srt</code></li>
+        <li>WebSocket: <code>ws://localhost:8000/ws/stream?session_id=demo</code></li>
+        <li>Export (legacy GET): <code>/export/&lt;session_id&gt;?format=txt|docx|srt</code></li>
       </ul>
     </body>
     </html>
     """
 
 # ─────────────────────────────────────────────────────────────
-# 최소–최대 윈도우 버퍼 (EN 누적 → KO 배치 번역용)
+# 최소–최대 윈도우 버퍼
 # ─────────────────────────────────────────────────────────────
 class CaptionBuffer:
     def __init__(self, min_window_sec: float = 8.0, max_window_sec: float = 12.0, min_chars: int = 20):
-        assert max_window_sec >= min_window_sec, "max_window_sec must be >= min_window_sec"
+        assert max_window_sec >= min_window_sec
         self.min_window = min_window_sec
         self.max_window = max_window_sec
         self.min_chars = min_chars
@@ -102,7 +136,7 @@ class CaptionBuffer:
         return seg, en
 
 # ─────────────────────────────────────────────────────────────
-# WebSocket: EN(실시간 partial→final) + KO(10초 배치)
+# WebSocket (옵션)
 # ─────────────────────────────────────────────────────────────
 @app.websocket("/ws/stream")
 async def ws_stream(websocket: WebSocket, session_id: str = Query("default")):
@@ -112,8 +146,7 @@ async def ws_stream(websocket: WebSocket, session_id: str = Query("default")):
     seq = 1
     pending = None  # {"seq","t0","t1","text_en"}
     buffer = CaptionBuffer(min_window_sec=10.0, max_window_sec=15.0, min_chars=25)
-    prev_en_block = None  # (V2 대비: 바로 이전 KO 블록 EN)
-    timeline_pos = 0.0 # 청크들의 글로벌 시작 시간 명시 (초)
+    timeline_pos = 0.0
 
     try:
         while True:
@@ -127,9 +160,7 @@ async def ws_stream(websocket: WebSocket, session_id: str = Query("default")):
             else:
                 seg_t0 = seg_t1 = 0.0
 
-
-
-            # ➊ 직전 pending을 final로 확정 + KO 버퍼 누적/번역
+            # 직전 pending을 final로 확정 + 배치 번역 후보로 버퍼링
             if pending and pending["text_en"]:
                 await websocket.send_json({
                     "type": "en_final",
@@ -145,62 +176,141 @@ async def ws_stream(websocket: WebSocket, session_id: str = Query("default")):
                     await websocket.send_json({
                         "type": "ko_batch",
                         "window": {"t0": ft0, "t1": ft1},
-                        "text_en": full_en,   # 필요 없으면 삭제 가능
+                        "text_en": full_en,
                         "text_ko": text_ko
                     })
-                    prev_en_block = full_en  # (V2 대비)
-                
-                # 직전 청크 길이만큼 글로벌 타임라인을 전진
                 timeline_pos = pending["t1"]
 
-            # 직전 청크의 글로벌 끝으로 타임라인 전진
-            if pending:
-                timeline_pos = pending["t1"]
-
-            # 청크를 받아서 로컬 -> 글로벌 타임라인으로 맵핑
             g_t0 = timeline_pos + seg_t0
             g_t1 = timeline_pos + seg_t1
 
-            # ➋ 현재 청크는 즉시 partial로 표시
-            cur = {"seq": seq, "t0": g_t0, "t1": g_t1, "text_en": text_en, "local_t0": seg_t0, "local_t1": seg_t1}
+            # 이번 청크는 partial
+            cur = {"seq": seq, "t0": r2(g_t0), "t1": r2(g_t1), "text_en": text_en}
             await websocket.send_json({
                 "type": "en_partial",
                 "seq": seq,
-                "t0": seg_t0, "t1": seg_t1,
-                "t0": r2(g_t0), "t1": r2(g_t1),  # 글로벌 타임라인 위치
+                "t0": r2(g_t0), "t1": r2(g_t1),
                 "text_en": text_en
             })
             pending = cur
             seq += 1
 
     except WebSocketDisconnect:
-        # 마지막 pending을 final 처리 + KO 버퍼 반영
+        # 연결 종료 후에는 클라이언트로 전송하지 않음 (로그 노이즈 방지)
         if pending and pending["text_en"]:
-            await websocket.send_json({
-                "type": "en_final",
-                "seq": pending["seq"],
-                "t0": pending["t0"], "t1": pending["t1"],
-                "text_en": pending["text_en"],
-            })
             buffer.add(pending["t0"], pending["t1"], pending["text_en"])
-
-        # 남은 KO 버퍼 flush
-        if buffer.en_parts:
+        if getattr(buffer, "en_parts", None):
             (ft0, ft1), full_en = buffer.flush()
             text_ko = translate_text(full_en) if full_en else ""
             SESSION.append(session_id, ft0, ft1, full_en, text_ko)
-            await websocket.send_json({
-                "type": "ko_batch",
-                "window": {"t0": r2(ft0), "t1": r2(ft1)},
-                # "text_en": full_en,
-                "text_ko": text_ko
-            })
         SESSION.end(session_id)
     except Exception as e:
-        await websocket.send_json({"type": "error", "message": str(e)})
+        # 연결이 살아있으면 에러 반환 시도
+        try:
+            await websocket.send_json({"type": "error", "message": str(e)})
+        except Exception:
+            pass
 
 # ─────────────────────────────────────────────────────────────
-# 내보내기 (TXT / DOCX / SRT)
+# REST: 세션/청크/트랜스크립트/내보내기
+# ─────────────────────────────────────────────────────────────
+@app.post("/session/start")
+def http_session_start():
+    sid = str(uuid.uuid4())
+    SESSION.start(sid)
+    SESSION_TIMELINE[sid] = 0.0
+    (DATA_DIR / "sessions" / sid).mkdir(parents=True, exist_ok=True)
+    return {"session_id": sid}
+
+@app.post("/session/stop")
+def http_session_stop(session_id: str = Form(...)):
+    if session_id not in SESSION_TIMELINE:
+        return {"ok": False, "reason": "invalid session_id"}
+    SESSION.end(session_id)
+    return {"ok": True}
+
+@app.post("/chunk")
+async def http_upload_chunk(session_id: str = Form(...), blob: UploadFile = File(...)):
+    if session_id not in SESSION_TIMELINE:
+        return {"ok": False, "reason": "invalid session_id"}
+
+    # 파일 저장(선택)
+    sess_dir = DATA_DIR / "sessions" / session_id / "chunks"
+    sess_dir.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    ext = Path(blob.filename).suffix or ".webm"
+    save_path = sess_dir / f"chunk_{ts}{ext}"
+    with save_path.open("wb") as f:
+        shutil.copyfileobj(blob.file, f)
+
+    # ASR
+    with save_path.open("rb") as f:
+        audio_bytes = f.read()
+    asr = transcribe_chunk(audio_bytes)
+    text_en = clean_en((asr.get("text") or "").strip())
+
+    seg_t0 = asr["segments"][0]["start"] if asr.get("segments") else 0.0
+    seg_t1 = asr["segments"][-1]["end"] if asr.get("segments") else 0.0
+
+    # 글로벌 타임라인
+    last_end = SESSION_TIMELINE.get(session_id, 0.0)
+    g_t0 = last_end + seg_t0
+    g_t1 = last_end + seg_t1
+    SESSION_TIMELINE[session_id] = g_t1
+
+    # 번역 + 세션 기록
+    text_ko = translate_text(text_en) if text_en else ""
+    SESSION.append(session_id, g_t0, g_t1, text_en, text_ko)
+
+    return {"ok": True, "saved": save_path.name, "text_en": text_en, "t0": r2(g_t0), "t1": r2(g_t1)}
+
+@app.get("/transcript")
+def http_transcript(session_id: str):
+    try:
+        content = SESSION.to_txt(session_id)
+    except Exception:
+        content = ""
+    return {"transcript": content}
+
+@app.post("/export")
+def http_export(session_id: str = Form(...), format: str = "docx"):
+    data = SESSION.get(session_id)
+    entries = data.get("entries", []) if data else []
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    if format == "txt":
+        content = SESSION.to_txt(session_id)
+        out = (DATA_DIR / "exports" / f"{session_id}_{ts}.txt")
+        out.write_text(content, encoding="utf-8")
+        return {"download_url": f"/download/{out.name}"}
+
+    if format == "srt":
+        content = SESSION.to_srt(session_id)
+        out = (DATA_DIR / "exports" / f"{session_id}_{ts}.srt")
+        out.write_text(content, encoding="utf-8")
+        return {"download_url": f"/download/{out.name}"}
+
+    # docx
+    buf: BytesIO = build_docx(entries)
+    out = (DATA_DIR / "exports" / f"{session_id}_{ts}.docx")
+    out.write_bytes(buf.getvalue())
+    return {"download_url": f"/download/{out.name}"}
+
+@app.get("/download/{filename}")
+def http_download(filename: str):
+    file_path = DATA_DIR / "exports" / filename
+    if not file_path.exists():
+        return PlainTextResponse("file not found", status_code=404)
+    if file_path.suffix == ".docx":
+        mt = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    elif file_path.suffix == ".srt":
+        mt = "application/x-subrip"
+    else:
+        mt = "text/plain"
+    return FileResponse(file_path, filename=file_path.name, media_type=mt)
+
+# ─────────────────────────────────────────────────────────────
+# 기존 내보내기 (GET /export/{session_id})
 # ─────────────────────────────────────────────────────────────
 @app.get("/export/{session_id}")
 def export_text(session_id: str, format: str = Query("txt")):
@@ -210,21 +320,18 @@ def export_text(session_id: str, format: str = Query("txt")):
     if format == "txt":
         content = SESSION.to_txt(session_id)
         return PlainTextResponse(
-            content,
-            headers={"Content-Disposition": f'attachment; filename="{session_id}.txt"'}
+            content, headers={"Content-Disposition": f'attachment; filename="{session_id}.txt"'}
         )
-    elif format == "docx":
+    if format == "docx":
         buf = build_docx(entries)
         return StreamingResponse(
             buf,
             media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
             headers={"Content-Disposition": f'attachment; filename="{session_id}.docx"'}
         )
-    elif format == "srt":
+    if format == "srt":
         content = SESSION.to_srt(session_id)
         return PlainTextResponse(
-            content,
-            headers={"Content-Disposition": f'attachment; filename="{session_id}.srt"'}
+            content, headers={"Content-Disposition": f'attachment; filename="{session_id}.srt"'}
         )
-    else:
-        return PlainTextResponse("Unsupported format", status_code=400)
+    return PlainTextResponse("Unsupported format", status_code=400)
