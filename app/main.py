@@ -243,10 +243,29 @@ async def http_upload_chunk(session_id: str = Form(...), blob: UploadFile = File
     with save_path.open("wb") as f:
         shutil.copyfileobj(blob.file, f)
 
-    # ASR
+    # ASR 수행
     with save_path.open("rb") as f:
         audio_bytes = f.read()
-    asr = transcribe_chunk(audio_bytes)
+
+    # 업로드된 실제 content-type/확장자 로깅(디버그에 유용)
+    uploaded_ct = getattr(blob, "content_type", None) or "unknown"
+    ext = (save_path.suffix or "").lower()
+    safe_name = save_path.name
+    # SDK가 filename 확장자로 포맷을 추론하므로 .webm/ .ogg/ .wav 등이 중요함
+
+    try:
+        asr = transcribe_chunk(audio_bytes, filename=safe_name)
+    except ValueError as e:
+        # 포맷/디코딩 실패 등 → 415 (Unsupported Media Type)로 정리
+        msg = f"ASR error: {str(e)} (ct={uploaded_ct}, ext={ext})"
+        return PlainTextResponse(msg, status_code=415)
+
+    text_en = clean_en((asr.get("text") or "").strip())
+
+    seg_t0 = asr["segments"][0]["start"] if asr.get("segments") else 0.0
+    seg_t1 = asr["segments"][-1]["end"] if asr.get("segments") else 0.0
+
+
     text_en = clean_en((asr.get("text") or "").strip())
 
     seg_t0 = asr["segments"][0]["start"] if asr.get("segments") else 0.0

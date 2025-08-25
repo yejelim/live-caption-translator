@@ -1,63 +1,44 @@
 # app/asr.py
 import os
-from typing import Dict, Any, Tuple, Optional
-from openai import OpenAI
-from openai import BadRequestError
+from io import BytesIO
+from typing import Dict, Any
+from openai import OpenAI, BadRequestError
 from tenacity import retry, stop_after_attempt, wait_fixed
 
-# ASR 모델은 환경변수로 선택 가능 (기본: whisper-1)
 _WHISPER_MODEL = os.getenv("ASR_MODEL", "whisper-1")
-
 _client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-def _file_tuple_from_bytes(
-    b: bytes,
-    filename: str = "chunk.webm",
-    mime: str = "audio/webm",
-) -> Tuple[str, bytes, str]:
-    """
-    OpenAI audio API가 받는 (filename, bytes, content_type) 튜플을 만듭니다.
-    """
-    return (filename, b, mime)
-
-@retry(stop=stop_after_attempt(3), wait=wait_fixed(0.5))
-def _whisper_call(model: str, file_tuple: Tuple[str, bytes, str]) -> Any:
-    """
-    OpenAI Transcriptions API 호출 (verbose_json으로 세그먼트를 함께 반환).
-    webm/opus를 그대로 전달합니다.
-    """
+@retry(stop=stop_after_attempt(3), wait=wait_fixed(0.4))
+def _whisper_call(model: str, fileobj: BytesIO):
+    # fileobj.name 이 확실히 존재해야 SDK가 포맷(webm/ogg/wav 등)을 잘 인식함
     return _client.audio.transcriptions.create(
         model=model,
-        file=file_tuple,
-        response_format="verbose_json",  # segments 포함
-        # language="en",  # 필요 시 고정
-        # prompt="...",   # 도메인 프롬프트 활용 시
+        file=fileobj,
+        response_format="verbose_json",
     )
 
-def transcribe_chunk(audio_bytes: bytes, *, mime: Optional[str] = None, filename: Optional[str] = None) -> Dict[str, Any]:
+def transcribe_chunk(audio_bytes: bytes, *, filename: str = "chunk.webm") -> Dict[str, Any]:
     """
-    업로드된 원본 바이트를 webm 그대로 OpenAI로 전송해 텍스트/세그먼트를 반환.
-    - mime/filename이 넘어오면 그대로 사용 (기본은 audio/webm / chunk.webm)
+    업로드 원본 바이트를 BytesIO로 감싸서 OpenAI로 전송.
+    filename 확장자로 포맷(webm/ogg/wav/mp3 등) 추론을 돕는다.
     """
-    _mime = mime or "audio/webm"
-    _filename = filename or ("chunk.webm" if _mime.startswith("audio/webm") else "chunk.bin")
-    ft = _file_tuple_from_bytes(audio_bytes, filename=_filename, mime=_mime)
+    if not audio_bytes or len(audio_bytes) < 100:  # 너무 작으면 대부분 빈 청크
+        raise ValueError("Empty or too-small audio chunk")
+
+    bio = BytesIO(audio_bytes)
+    bio.name = filename  # 굉장히 중요!
 
     try:
-        resp = _whisper_call(_WHISPER_MODEL, ft)
+        resp = _whisper_call(_WHISPER_MODEL, bio)
     except BadRequestError as e:
-        # 상위에서 처리할 수 있도록 의미있는 메시지로 재랭글
-        raise ValueError(f"ASR decode failed: {getattr(e, 'message', str(e))}")
+        # 예: Invalid file format, decode 실패 등
+        raise ValueError(getattr(e, "message", str(e)))
 
-    # whisper-1 verbose_json 포맷 가정
-    # resp.text, resp.segments (start, end, text 등)을 반환
     out = {
         "text": getattr(resp, "text", "") or "",
         "segments": [],
     }
-    segs = getattr(resp, "segments", None) or []
-    for s in segs:
-        # 일부 필드만 추려서 반환
+    for s in getattr(resp, "segments", []) or []:
         out["segments"].append({
             "start": float(getattr(s, "start", 0.0) or 0.0),
             "end": float(getattr(s, "end", 0.0) or 0.0),
