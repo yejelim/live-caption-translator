@@ -229,6 +229,18 @@ def http_session_stop(session_id: str = Form(...)):
     SESSION.end(session_id)
     return {"ok": True}
 
+def _looks_like_webm_or_ogg(b: bytes) -> bool:
+    if not b or len(b) < 16:
+        return False
+    h = b[:4]
+    # EBML(WebM): 1A 45 DF A3
+    if h == bytes([0x1A, 0x45, 0xDF, 0xA3]):
+        return True
+    # Ogg: "OggS"
+    if h == b"OggS":
+        return True
+    return False
+
 @app.post("/chunk")
 async def http_upload_chunk(session_id: str = Form(...), blob: UploadFile = File(...)):
     if session_id not in SESSION_TIMELINE:
@@ -243,31 +255,32 @@ async def http_upload_chunk(session_id: str = Form(...), blob: UploadFile = File
     with save_path.open("wb") as f:
         shutil.copyfileobj(blob.file, f)
 
-    # ASR 수행
+    # 파일 읽기
     with save_path.open("rb") as f:
         audio_bytes = f.read()
+
+    # ASR 수행 직전: 매직 검사로 불량 청크는 건너뜀
+    if not _looks_like_webm_or_ogg(audio_bytes):
+        return PlainTextResponse("skipped: invalid audio header", status_code=204)
 
     # 업로드된 실제 content-type/확장자 로깅(디버그에 유용)
     uploaded_ct = getattr(blob, "content_type", None) or "unknown"
     ext = (save_path.suffix or "").lower()
-    safe_name = save_path.name
-    # SDK가 filename 확장자로 포맷을 추론하므로 .webm/ .ogg/ .wav 등이 중요함
+    safe_name = save_path.name  # SDK가 filename 확장자로 포맷을 추론
 
+    # ASR 수행
     try:
         asr = transcribe_chunk(audio_bytes, filename=safe_name)
     except ValueError as e:
-        # 포맷/디코딩 실패 등 → 415 (Unsupported Media Type)로 정리
+        # 포맷/디코딩 실패 등 → 415 (Unsupported Media Type)
         msg = f"ASR error: {str(e)} (ct={uploaded_ct}, ext={ext})"
         return PlainTextResponse(msg, status_code=415)
+    except Exception as e:
+        # 기타 예외 → 400으로 다운그레이드
+        msg = f"ASR unexpected error: {type(e).__name__}: {str(e)} (ct={uploaded_ct}, ext={ext})"
+        return PlainTextResponse(msg, status_code=400)
 
     text_en = clean_en((asr.get("text") or "").strip())
-
-    seg_t0 = asr["segments"][0]["start"] if asr.get("segments") else 0.0
-    seg_t1 = asr["segments"][-1]["end"] if asr.get("segments") else 0.0
-
-
-    text_en = clean_en((asr.get("text") or "").strip())
-
     seg_t0 = asr["segments"][0]["start"] if asr.get("segments") else 0.0
     seg_t1 = asr["segments"][-1]["end"] if asr.get("segments") else 0.0
 
