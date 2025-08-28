@@ -9,9 +9,17 @@ from datetime import datetime
 import uuid
 import shutil
 from io import BytesIO
+import asyncio
+import json
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query, UploadFile, File, Form
-from fastapi.responses import PlainTextResponse, StreamingResponse, HTMLResponse, FileResponse
+# 환경변수 검증
+required_env_vars = ["OPENAI_API_KEY"]
+missing_vars = [var for var in required_env_vars if not os.getenv(var)]
+if missing_vars:
+    raise ValueError(f"Missing required environment variables: {', '.join(missing_vars)}")
+
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query, UploadFile, File, Form, Request
+from fastapi.responses import PlainTextResponse, StreamingResponse, HTMLResponse, FileResponse, JSONResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.asr import transcribe_chunk
@@ -32,6 +40,12 @@ app.add_middleware(
         "http://127.0.0.1:3000",
         "http://localhost:3001",
         "http://127.0.0.1:3001",
+        "http://localhost:3002",
+        "http://127.0.0.1:3002",
+        "http://localhost:5173",  # Vite default
+        "http://127.0.0.1:5173",
+        "http://localhost:8080",  # Vue CLI default
+        "http://127.0.0.1:8080",
     ],
     allow_origin_regex=r"http://localhost:\d+$",
     allow_credentials=True,
@@ -59,31 +73,6 @@ DATA_DIR = Path("data")
 (DATA_DIR / "exports").mkdir(parents=True, exist_ok=True)
 
 SESSION_TIMELINE = {}  # session_id -> float (HTTP 청크용 글로벌 타임라인)
-
-# ─────────────────────────────────────────────────────────────
-# 헬스/인덱스
-# ─────────────────────────────────────────────────────────────
-@app.get("/health")
-def health():
-    return {"ok": True}
-
-@app.get("/", response_class=HTMLResponse)
-def index():
-    return """
-    <!doctype html>
-    <html>
-    <head><meta charset="utf-8"><title>Live Caption Translator</title></head>
-    <body style="font-family: system-ui, -apple-system, sans-serif; padding: 24px; line-height: 1.5;">
-      <h1>Live Caption Translator</h1>
-      <ul>
-        <li>Health: <a href="/health">/health</a></li>
-        <li>API Docs (Swagger): <a href="/docs">/docs</a></li>
-        <li>WebSocket: <code>ws://localhost:8000/ws/stream?session_id=demo</code></li>
-        <li>Export (legacy GET): <code>/export/&lt;session_id&gt;?format=txt|docx|srt</code></li>
-      </ul>
-    </body>
-    </html>
-    """
 
 # ─────────────────────────────────────────────────────────────
 # 최소–최대 윈도우 버퍼
@@ -134,6 +123,101 @@ class CaptionBuffer:
         seg = (self.t0 or 0.0, self.t1 or 0.0)
         self.reset()
         return seg, en
+
+# ─────────────────────────────────────────────────────────────
+# SSE 브로커 & 버퍼 캐시 (세션별)
+# ─────────────────────────────────────────────────────────────
+class EventBroker:
+    def __init__(self):
+        self._subs: dict[str, set[asyncio.Queue]] = {}
+        self._lock = asyncio.Lock()
+        self._msg_id = 0
+
+    async def subscribe(self, session_id: str) -> asyncio.Queue:
+        q: asyncio.Queue = asyncio.Queue()
+        async with self._lock:
+            self._subs.setdefault(session_id, set()).add(q)
+        return q
+
+    async def unsubscribe(self, session_id: str, q: asyncio.Queue):
+        async with self._lock:
+            if session_id in self._subs:
+                self._subs[session_id].discard(q)
+                if not self._subs[session_id]:
+                    del self._subs[session_id]
+
+    async def publish(self, session_id: str, event_type: str, data: dict):
+        async with self._lock:
+            qs = list(self._subs.get(session_id, []))
+            self._msg_id += 1
+            msg = {"type": event_type, "data": data, "id": self._msg_id}
+        for q in qs:
+            try:
+                q.put_nowait(msg)
+            except Exception:
+                pass
+
+BROKER = EventBroker()
+BUFFERS: dict[str, CaptionBuffer] = {}  # session_id -> CaptionBuffer
+
+# ─────────────────────────────────────────────────────────────
+# 헬스/인덱스
+# ─────────────────────────────────────────────────────────────
+@app.get("/health")
+def health():
+    return {"ok": True}
+
+@app.get("/", response_class=HTMLResponse)
+def index():
+    return """
+    <!doctype html>
+    <html>
+    <head><meta charset="utf-8"><title>Live Caption Translator</title></head>
+    <body style="font-family: system-ui, -apple-system, sans-serif; padding: 24px; line-height: 1.5;">
+      <h1>Live Caption Translator</h1>
+      <ul>
+        <li>Health: <a href="/health">/health</a></li>
+        <li>API Docs (Swagger): <a href="/docs">/docs</a></li>
+        <li>WebSocket: <code>ws://localhost:8000/ws/stream?session_id=demo</code></li>
+        <li>SSE events: <code>/events?session_id=&lt;id&gt;</code></li>
+        <li>Export (legacy GET): <code>/export/&lt;session_id&gt;?format=txt|docx|srt</code></li>
+      </ul>
+    </body>
+    </html>
+    """
+
+# ─────────────────────────────────────────────────────────────
+# SSE (서버 푸시)
+# ─────────────────────────────────────────────────────────────
+@app.get("/events")
+async def sse_events(request: Request, session_id: str):
+    async def gen():
+        q = await BROKER.subscribe(session_id)
+        try:
+            # handshake
+            yield "event: ping\ndata: {}\n\n"
+            while True:
+                if await request.is_disconnected():
+                    break
+                try:
+                    msg = await asyncio.wait_for(q.get(), timeout=30.0)
+                    payload = (
+                        f"event: {msg['type']}\n"
+                        f"id: {msg['id']}\n"
+                        f"data: {json.dumps(msg['data'], ensure_ascii=False)}\n\n"
+                    )
+                    yield payload
+                except asyncio.TimeoutError:
+                    # keep-alive comment
+                    yield ": keep-alive\n\n"
+        finally:
+            await BROKER.unsubscribe(session_id, q)
+
+    headers = {
+        "Cache-Control": "no-cache",
+        "X-Accel-Buffering": "no",  # nginx 버퍼링 방지(있다면)
+    }
+    return StreamingResponse(gen(), media_type="text/event-stream", headers=headers)
 
 # ─────────────────────────────────────────────────────────────
 # WebSocket (옵션)
@@ -196,7 +280,6 @@ async def ws_stream(websocket: WebSocket, session_id: str = Query("default")):
             seq += 1
 
     except WebSocketDisconnect:
-        # 연결 종료 후에는 클라이언트로 전송하지 않음 (로그 노이즈 방지)
         if pending and pending["text_en"]:
             buffer.add(pending["t0"], pending["t1"], pending["text_en"])
         if getattr(buffer, "en_parts", None):
@@ -205,7 +288,6 @@ async def ws_stream(websocket: WebSocket, session_id: str = Query("default")):
             SESSION.append(session_id, ft0, ft1, full_en, text_ko)
         SESSION.end(session_id)
     except Exception as e:
-        # 연결이 살아있으면 에러 반환 시도
         try:
             await websocket.send_json({"type": "error", "message": str(e)})
         except Exception:
@@ -220,14 +302,39 @@ def http_session_start():
     SESSION.start(sid)
     SESSION_TIMELINE[sid] = 0.0
     (DATA_DIR / "sessions" / sid).mkdir(parents=True, exist_ok=True)
+    print(f"[DEBUG] Session started: {sid}")
     return {"session_id": sid}
 
 @app.post("/session/stop")
-def http_session_stop(session_id: str = Form(...)):
+async def http_session_stop(session_id: str = Form(...)):
+    print(f"[DEBUG] Session stop requested: {session_id}")
     if session_id not in SESSION_TIMELINE:
-        return {"ok": False, "reason": "invalid session_id"}
-    SESSION.end(session_id)
-    return {"ok": True}
+        print(f"[DEBUG] Invalid session ID: {session_id}")
+        print(f"[DEBUG] Available sessions: {list(SESSION_TIMELINE.keys())}")
+        return JSONResponse({"ok": False, "reason": "invalid session_id"}, status_code=400)
+
+    try:
+        # 남은 버퍼 플러시
+        buf = BUFFERS.pop(session_id, None)
+        if buf and getattr(buf, "en_parts", None):
+            (ft0, ft1), full_en = buf.flush()
+            if full_en:
+                text_ko = translate_text(full_en)
+                SESSION.append(session_id, ft0, ft1, full_en, text_ko)
+                # 세션 종료 직전 마지막 배치도 알림(구독자가 보통 열려있을 수 있음)
+                await BROKER.publish(session_id, "ko_batch", {
+                    "window": {"t0": r2(ft0), "t1": r2(ft1)},
+                    "text_en": full_en,
+                    "text_ko": text_ko
+                })
+
+        SESSION.end(session_id)
+        SESSION_TIMELINE.pop(session_id, None)
+        print(f"[DEBUG] Session stopped successfully: {session_id}")
+        return JSONResponse({"ok": True})
+    except Exception as e:
+        print(f"[DEBUG] Session stop error: {e}")
+        return JSONResponse({"ok": False, "reason": f"Session stop failed: {str(e)}"}, status_code=500)
 
 def _looks_like_webm_or_ogg(b: bytes) -> bool:
     if not b or len(b) < 16:
@@ -243,8 +350,16 @@ def _looks_like_webm_or_ogg(b: bytes) -> bool:
 
 @app.post("/chunk")
 async def http_upload_chunk(session_id: str = Form(...), blob: UploadFile = File(...)):
+    print(f"[DEBUG] Chunk upload for session: {session_id}")
     if session_id not in SESSION_TIMELINE:
-        return {"ok": False, "reason": "invalid session_id"}
+        print(f"[DEBUG] Invalid session ID in chunk upload: {session_id}")
+        print(f"[DEBUG] Available sessions: {list(SESSION_TIMELINE.keys())}")
+        return JSONResponse({"ok": False, "reason": "invalid session_id"}, status_code=400)
+
+    # 파일 크기 검증
+    if not blob.file or blob.size is None or blob.size < 100:
+        print(f"[DEBUG] File too small: {blob.size} bytes")
+        return Response(status_code=204)
 
     # 파일 저장(선택)
     sess_dir = DATA_DIR / "sessions" / session_id / "chunks"
@@ -259,14 +374,22 @@ async def http_upload_chunk(session_id: str = Form(...), blob: UploadFile = File
     with save_path.open("rb") as f:
         audio_bytes = f.read()
 
+    # 파일 크기 재검증
+    if len(audio_bytes) < 100:
+        print(f"[DEBUG] Skipping small chunk: {len(audio_bytes)} bytes")
+        return Response(status_code=204)
+
     # ASR 수행 직전: 매직 검사로 불량 청크는 건너뜀
     if not _looks_like_webm_or_ogg(audio_bytes):
-        return PlainTextResponse("skipped: invalid audio header", status_code=204)
+        print(f"[DEBUG] Skipping invalid audio header: {audio_bytes[:4].hex()}")
+        return Response(status_code=204)
 
     # 업로드된 실제 content-type/확장자 로깅(디버그에 유용)
     uploaded_ct = getattr(blob, "content_type", None) or "unknown"
     ext = (save_path.suffix or "").lower()
     safe_name = save_path.name  # SDK가 filename 확장자로 포맷을 추론
+
+    print(f"[DEBUG] Processing chunk: {len(audio_bytes)} bytes, type: {uploaded_ct}, ext: {ext}")
 
     # ASR 수행
     try:
@@ -274,15 +397,19 @@ async def http_upload_chunk(session_id: str = Form(...), blob: UploadFile = File
     except ValueError as e:
         # 포맷/디코딩 실패 등 → 415 (Unsupported Media Type)
         msg = f"ASR error: {str(e)} (ct={uploaded_ct}, ext={ext})"
-        return PlainTextResponse(msg, status_code=415)
+        print(f"[DEBUG] ASR ValueError: {msg}")
+        return JSONResponse({"ok": False, "reason": msg}, status_code=415)
     except Exception as e:
         # 기타 예외 → 400으로 다운그레이드
         msg = f"ASR unexpected error: {type(e).__name__}: {str(e)} (ct={uploaded_ct}, ext={ext})"
-        return PlainTextResponse(msg, status_code=400)
+        print(f"[DEBUG] ASR Exception: {msg}")
+        return JSONResponse({"ok": False, "reason": msg}, status_code=400)
 
     text_en = clean_en((asr.get("text") or "").strip())
     seg_t0 = asr["segments"][0]["start"] if asr.get("segments") else 0.0
     seg_t1 = asr["segments"][-1]["end"] if asr.get("segments") else 0.0
+
+    print(f"[DEBUG] ASR result: '{text_en}' ({len(text_en)} chars)")
 
     # 글로벌 타임라인
     last_end = SESSION_TIMELINE.get(session_id, 0.0)
@@ -290,11 +417,28 @@ async def http_upload_chunk(session_id: str = Form(...), blob: UploadFile = File
     g_t1 = last_end + seg_t1
     SESSION_TIMELINE[session_id] = g_t1
 
-    # 번역 + 세션 기록
-    text_ko = translate_text(text_en) if text_en else ""
-    SESSION.append(session_id, g_t0, g_t1, text_en, text_ko)
+    # (1) en_partial을 즉시 SSE로 전송
+    await BROKER.publish(session_id, "en_partial", {"t0": r2(g_t0), "t1": r2(g_t1), "text_en": text_en})
 
-    return {"ok": True, "saved": save_path.name, "text_en": text_en, "t0": r2(g_t0), "t1": r2(g_t1)}
+    # (2) 배치 번역을 위한 버퍼링
+    buf = BUFFERS.get(session_id)
+    if buf is None:
+        buf = CaptionBuffer(min_window_sec=10.0, max_window_sec=15.0, min_chars=25)
+        BUFFERS[session_id] = buf
+    buf.add(g_t0, g_t1, text_en)
+
+    # (3) 준비되면 flush → 번역 → 세션 누적 → SSE ko_batch
+    if buf.ready():
+        (ft0, ft1), full_en = buf.flush()
+        text_ko = translate_text(full_en) if full_en else ""
+        SESSION.append(session_id, ft0, ft1, full_en, text_ko)
+        await BROKER.publish(session_id, "ko_batch", {
+            "window": {"t0": r2(ft0), "t1": r2(ft1)},
+            "text_en": full_en,
+            "text_ko": text_ko
+        })
+
+    return JSONResponse({"ok": True, "saved": save_path.name, "text_en": text_en, "t0": r2(g_t0), "t1": r2(g_t1)})
 
 @app.get("/transcript")
 def http_transcript(session_id: str):
