@@ -346,6 +346,10 @@ def _looks_like_webm_or_ogg(b: bytes) -> bool:
     # Ogg: "OggS"
     if h == b"OggS":
         return True
+    if h4 == bytes([0x1F, 0x43, 0xB6, 0x75]):  # Opus in Ogg
+        return True
+    if b.find(bytes([0x1A, 0x45, 0xDF, 0xA3]), 0, 64) != -1:  # EBML 헤더가 앞에 있는지
+        return True
     return False
 
 @app.post("/chunk")
@@ -377,11 +381,6 @@ async def http_upload_chunk(session_id: str = Form(...), blob: UploadFile = File
     # 파일 크기 재검증
     if len(audio_bytes) < 100:
         print(f"[DEBUG] Skipping small chunk: {len(audio_bytes)} bytes")
-        return Response(status_code=204)
-
-    # ASR 수행 직전: 매직 검사로 불량 청크는 건너뜀
-    if not _looks_like_webm_or_ogg(audio_bytes):
-        print(f"[DEBUG] Skipping invalid audio header: {audio_bytes[:4].hex()}")
         return Response(status_code=204)
 
     # 업로드된 실제 content-type/확장자 로깅(디버그에 유용)
