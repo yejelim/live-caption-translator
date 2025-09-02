@@ -99,6 +99,9 @@ function guessExtFromType(type: string): string {
   return ".wav";
 }
 
+const LIVE_MIN_CHARS = 80;
+const LIVE_MAX_AGE_MS = 2500;
+
 export default function RecorderApp() {
   /** ---------- UI state ---------- */
   const [sessionId, setSessionId] = useState<string | null>(null);
@@ -116,6 +119,10 @@ export default function RecorderApp() {
   const sseRef = useRef<EventSource | null>(null);
   const [liveLine, setLiveLine] = useState<string>("");
   const [lines, setLines] = useState<ConfirmedLine[]>([]);
+
+  const liveBufRef = useRef<string[]>([]);
+  const liveLastUpdateRef = useRef<number>(0);
+  const liveFlushTimerRef = useRef<number | null>(null);
 
   /** ---------- Media / flow refs ---------- */
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
@@ -216,14 +223,56 @@ export default function RecorderApp() {
       console.log("[SSE] Connected");
       setStatusMsg("SSE connected");
     };
+    
+    // openSSE 안의 en_partial 이벤트 리스너 교체
+
     ev.addEventListener("en_partial", (e: MessageEvent) => {
       try {
         const data = JSON.parse(e.data);
-        setLiveLine(String(data?.text_en || ""));
+        const snippet = String(data?.text_en || "").trim();
+        if (!snippet) return;
+
+        // 1) 버퍼에 누적
+        liveBufRef.current.push(snippet);
+
+        // 2) 디바운스/조건부 플러시
+        const now = Date.now();
+        const joined = liveBufRef.current.join(" ").replace(/\s+/g, " ").trim();
+
+        const shouldFlushByLen = joined.length >= LIVE_MIN_CHARS;
+        const shouldFlushByTime = now - (liveLastUpdateRef.current || 0) >= LIVE_MAX_AGE_MS;
+
+        const doFlush = () => {
+          const out = liveBufRef.current.join(" ").replace(/\s+/g, " ").trim();
+          if (out) {
+            setLiveLine(out);
+            liveLastUpdateRef.current = Date.now();
+          }
+          liveBufRef.current = [];
+          liveFlushTimerRef.current = null;
+        };
+
+        if (shouldFlushByLen || shouldFlushByTime) {
+          // 즉시 갱신
+          if (liveFlushTimerRef.current) {
+            window.clearTimeout(liveFlushTimerRef.current);
+            liveFlushTimerRef.current = null;
+          }
+          doFlush();
+        } else {
+          // 약간의 지연 후 갱신(사용자 체감 안정화)
+          if (!liveFlushTimerRef.current) {
+            liveFlushTimerRef.current = window.setTimeout(() => {
+              doFlush();
+            }, 600); // 0.6초 디바운스
+          }
+        }
       } catch (err) {
         console.warn("[SSE] Failed to parse en_partial:", e.data, err);
       }
     });
+
+
     ev.addEventListener("ko_batch", (e: MessageEvent) => {
       try {
         const data = JSON.parse(e.data);
@@ -232,8 +281,13 @@ export default function RecorderApp() {
         const en = String(data?.text_en ?? "");
         const ko = String(data?.text_ko ?? "");
         setLines((prev) => [...prev, { t0, t1, en, ko }]);
-        setTranscript((prev) => (prev ? prev + "\n" : "") + ko);
+        setTranscript((prev) => (prev ? prev + "\n" : "") + en);
         setLiveLine("");
+        liveBufRef.current = [];
+        if (liveFlushTimerRef.current) {
+          window.clearTimeout(liveFlushTimerRef.current);
+          liveFlushTimerRef.current = null;
+        }
       } catch (err) {
         console.warn("[SSE] Failed to parse ko_batch:", e.data, err);
       }
@@ -499,7 +553,7 @@ export default function RecorderApp() {
             </Button>
 
             <Button variant="outline" onClick={fetchTranscript} disabled={!sessionIdRef.current && !sessionId}>
-              <RefreshCw className="mr-2 h-4 w-4" /> 시간대별로 보기
+              <RefreshCw className="mr-2 h-4 w-4" /> 한국어 번역 보기
             </Button>
           </div>
 
@@ -518,7 +572,7 @@ export default function RecorderApp() {
               {lines.slice(-3).map((ln, i) => (
                 <div key={`${ln.t0}-${i}`} className="text-sm">
                   <span className="mr-2 text-muted-foreground">[{ln.t0.toFixed(1)}–{ln.t1.toFixed(1)}]</span>
-                  <span className="font-medium">{ln.ko}</span>
+                  <span className="font-medium">{ln.en}</span>
                 </div>
               ))}
             </div>
