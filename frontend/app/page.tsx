@@ -109,8 +109,8 @@ export default function RecorderApp() {
   const [downloadUrl, setDownloadUrl] = useState<string | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [sessionStatus, setSessionStatus] = useState<string>("Idle");
-  const [sessionActive, setSessionActive] = useState(false); // 세션이 활성 상태인지 확인
-  const [canResume, setCanResume] = useState(false); // 녹음 재개 가능한지 확인
+  const [sessionActive, setSessionActive] = useState(false); // (옵션) 사용 유지
+  const [canResume, setCanResume] = useState(false);
 
   /** ---------- Live captions via SSE ---------- */
   const sseRef = useRef<EventSource | null>(null);
@@ -140,7 +140,8 @@ export default function RecorderApp() {
       try { streamRef.current?.getTracks().forEach((t) => t.stop()); } catch {}
       allowUploadsRef.current = false;
       segmentingRef.current = false;
-      sessionIdRef.current = null;
+      // ❗ 세션은 언마운트 시에도 유지할지/정리할지 선택 사항
+      // 여기서 sessionIdRef를 null로 지우면 복구 불가이므로 유지
     };
   }, []);
 
@@ -158,6 +159,12 @@ export default function RecorderApp() {
     const form = new FormData();
     form.append("session_id", sid);
     await apiPostForm("/session/stop", form);
+  }, []);
+
+  const pauseSession = useCallback(async (sid: string) => {
+    const form = new FormData();
+    form.append("session_id", sid);
+    await apiPostForm("/session/pause", form);
   }, []);
 
   const uploadChunk = useCallback(async (sid: string, blob: Blob) => {
@@ -299,13 +306,14 @@ export default function RecorderApp() {
     }, SLICE_MS);
   }, [uploadChunk, setStatusMsg, setErrorMsg]);
 
-  /** ---------- Start / Stop ---------- */
+  /** ---------- Start / Pause / Resume / Complete ---------- */
   const handleStart = useCallback(async () => {
     setErrorMsg(null);
     setDownloadUrl(null);
     setTranscript("");
     setLiveLine("");
     setLines([]);
+    setCanResume(false); // 새 세션 시작이므로
 
     allowUploadsRef.current = true;
     segmentingRef.current = true;
@@ -323,6 +331,8 @@ export default function RecorderApp() {
 
       setRecording(true);
       setStatusMsg("Recording… (segmented)");
+      setSessionActive(true);
+      setSessionStatus("Recording");
     } catch (err: any) {
       allowUploadsRef.current = false;
       segmentingRef.current = false;
@@ -331,70 +341,101 @@ export default function RecorderApp() {
     }
   }, [startSession, openSSE, startRecorderSegment]);
 
-  const handleStop = useCallback(async () => {
+  const handlePause = useCallback(async () => {
     const sid = sessionIdRef.current;
     if (!sid) {
-      console.warn("[DEBUG] No session ID available for stop");
+      console.warn("[DEBUG] No session ID available for pause");
       return;
     }
 
-    // 업로드/세그먼트 즉시 차단
+    // 업로드/세그먼트 즉시 차단 (녹음만 멈춘다)
     allowUploadsRef.current = false;
     segmentingRef.current = false;
 
     try {
-      console.log("[DEBUG] Stopping recording, session ID:", sid);
+      console.log("[DEBUG] Pausing recording, session ID:", sid);
 
       try { mediaRecorderRef.current?.stop(); } catch {}
       try { streamRef.current?.getTracks().forEach((t) => t.stop()); } catch {}
       closeSSE();
 
       try { if (lastUploadRef.current) await lastUploadRef.current; } catch {}
-      try { await stopSession(sid); } catch (err: any) { setErrorMsg(err?.message || "Stop failed"); }
 
-      sessionIdRef.current = null;
+      // 세션은 종료하지 않는다
+      await pauseSession(sid);
+
+      // 세션 ID는 유지 → 재개 가능
       setRecording(false);
-      setSessionStatus("Idle");
       setCanResume(true);
-      setRecording(false);
-      setStatusMsg("Recording paused - you can resume or export transcript");
+      setStatusMsg("Paused — resume to continue appending to the same session");
+      setSessionStatus("Paused");
     } catch (err: any) {
-      console.error("[DEBUG] Stop recording error:", err);
-      setErrorMsg(err?.message || "Stop failed");
+      console.error("[DEBUG] Pause error:", err);
+      setErrorMsg(err?.message || "Pause failed");
     }
-  }, [closeSSE, stopSession]);
-
+  }, [closeSSE, pauseSession]);
 
   const handleResume = useCallback(async () => {
-    if (!sessionId) return;
+    const sid = sessionIdRef.current || sessionId;
+    if (!sid) return;
 
-    setRecording(true);
-    setCanResume(false);
-    // 기존 녹음 로직 재사용
-    // SSE 연결, MediaRecorder 시작 등
-  }, [sessionId]);
+    try {
+      // 기존 내용 유지: transcript/lines/liveline 초기화 금지
+      openSSE(sid);
 
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      streamRef.current = stream;
+
+      allowUploadsRef.current = true;
+      segmentingRef.current = true;
+      startRecorderSegment(sid, stream);
+
+      setRecording(true);
+      setCanResume(false);
+      setStatusMsg("Recording resumed (same session)");
+      setSessionStatus("Recording");
+    } catch (err: any) {
+      setErrorMsg(err?.message || "Resume failed");
+      setStatusMsg("Error");
+    }
+  }, [openSSE, startRecorderSegment, sessionId]);
 
   const handleCompleteSession = useCallback(async () => {
-    if (!sessionId) return;
-    
+    const sid = sessionIdRef.current || sessionId;
+    if (!sid) return;
+
+    // 업로드/세그먼트 차단 및 장치/채널 정리
+    allowUploadsRef.current = false;
+    segmentingRef.current = false;
+    try { mediaRecorderRef.current?.stop(); } catch {}
+    try { streamRef.current?.getTracks().forEach((t) => t.stop()); } catch {}
+    closeSSE();
+
     try {
-      await stopSession(sessionId);  // 백엔드에 세션 종료 요청
-      setSessionId(null);
-      setSessionActive(false);
-      setCanResume(false);
+      if (lastUploadRef.current) await lastUploadRef.current;
+    } catch {}
+
+    try {
+      await stopSession(sid);  // 백엔드에 세션 종료 요청
       setStatusMsg("Session completed");
+      setSessionActive(false);
+      setRecording(false);
+      setCanResume(false);
+      setSessionStatus("Idle");
+      // 종료해도 UI 텍스트는 보존 (다운로드/리뷰 가능)
+      // sessionIdRef/ sessionId는 선택적으로 null 처리 가능
+      // 여기선 다운로드 후에도 계속 같은 텍스트 표시를 원해 유지
     } catch (err: any) {
       setErrorMsg(err?.message || "Session completion failed");
     }
-  }, [sessionId, stopSession]);
+  }, [sessionId, stopSession, closeSSE]);
 
-  
   /** ---------- Manual fetch/export ---------- */
   const fetchTranscript = useCallback(async () => {
-    if (!sessionId) return;
+    const sid = sessionIdRef.current || sessionId;
+    if (!sid) return;
     try {
-      const data = await apiGet<{ transcript: string }>("/transcript", { session_id: sessionId });
+      const data = await apiGet<{ transcript: string }>("/transcript", { session_id: sid });
       setTranscript(data.transcript || "");
       setStatusMsg("Transcript refreshed");
     } catch (err: any) {
@@ -403,10 +444,11 @@ export default function RecorderApp() {
   }, [sessionId]);
 
   const handleExport = useCallback(async () => {
-    if (!sessionId) return;
+    const sid = sessionIdRef.current || sessionId;
+    if (!sid) return;
     try {
       const form = new FormData();
-      form.append("session_id", sessionId);
+      form.append("session_id", sid);
       const data = await apiPostForm<{ download_url: string }>("/export", form);
       const absolute = new URL(data.download_url, API_BASE_URL).toString();
       setDownloadUrl(absolute);
@@ -424,9 +466,11 @@ export default function RecorderApp() {
           <div className="flex items-center justify-between">
             <div>
               <CardTitle className="text-2xl">Lab Meeting Recorder</CardTitle>
-              <CardDescription>Start/Stop · Live captions · Export transcript</CardDescription>
+              <CardDescription>Start/Resume · Live captions · Export transcript</CardDescription>
             </div>
-              <Badge variant={recording ? "default" : "secondary"}>{recording ? "Recording" : "Idle"}</Badge>
+            <Badge variant={recording ? "default" : canResume ? "outline" : "secondary"}>
+              {recording ? "Recording" : canResume ? "Paused" : "Idle"}
+            </Badge>
           </div>
         </CardHeader>
         <Separator />
@@ -439,13 +483,22 @@ export default function RecorderApp() {
           )}
 
           <div className="flex flex-wrap gap-2">
+            {/* 새 세션 시작 (기존 내용 초기화) */}
             <Button onClick={handleStart} disabled={recording || !canRecord}>
-              <Mic className="mr-2 h-4 w-4" /> Start Recording
+              <Mic className="mr-2 h-4 w-4" /> Start New Session
             </Button>
-            <Button variant="secondary" onClick={handleStop} disabled={!recording}>
-              <Square className="mr-2 h-4 w-4" /> Stop Recording
+
+            {/* 일시정지 (세션 유지) */}
+            <Button variant="secondary" onClick={handlePause} disabled={!recording}>
+              <Square className="mr-2 h-4 w-4" /> Pause
             </Button>
-            <Button variant="outline" onClick={fetchTranscript} disabled={!sessionId}>
+
+            {/* 재개 (동일 세션) */}
+            <Button variant="outline" onClick={handleResume} disabled={!canResume || recording || !sessionIdRef.current}>
+              <Mic className="mr-2 h-4 w-4" /> Resume
+            </Button>
+
+            <Button variant="outline" onClick={fetchTranscript} disabled={!sessionIdRef.current && !sessionId}>
               <RefreshCw className="mr-2 h-4 w-4" /> 시간대별로 보기
             </Button>
           </div>
@@ -483,7 +536,7 @@ export default function RecorderApp() {
           </div>
 
           <div className="flex flex-wrap gap-2 items-center">
-            <Button onClick={handleExport} disabled={!sessionId || recording}>
+            <Button onClick={handleExport} disabled={!sessionIdRef.current && !sessionId || recording}>
               <FileText className="mr-2 h-4 w-4" /> Export to Word
             </Button>
             {downloadUrl && (
@@ -508,8 +561,15 @@ export default function RecorderApp() {
           )}
           <div className="text-xs text-muted-foreground">{statusMsg}</div>
         </CardContent>
-        <CardFooter className="text-xs text-muted-foreground">
-          Tip: 이 버전은 3초마다 레코더를 재시작해 모든 청크를 ‘완전 파일(헤더 포함)’로 보냅니다.
+
+        <CardFooter className="flex flex-col gap-2 text-xs text-muted-foreground">
+          <div>Tip: 이 버전은 3초마다 레코더를 재시작해 모든 청크를 ‘완전 파일(헤더 포함)’로 보냅니다.</div>
+          {/* 선택 버튼: 세션 완전 종료 (정리/아카이브 용도) */}
+          <div className="w-full flex items-center justify-end">
+            <Button variant="ghost" className="text-xs" onClick={handleCompleteSession} disabled={!sessionIdRef.current && !sessionId}>
+              세션 완전 종료
+            </Button>
+          </div>
         </CardFooter>
       </Card>
     </main>
