@@ -338,6 +338,22 @@ async def http_session_stop(session_id: str = Form(...)):
         print(f"[DEBUG] Session stop error: {e}")
         return JSONResponse({"ok": False, "reason": f"Session stop failed: {str(e)}"}, status_code=500)
 
+@app.post("/session/pause")
+async def http_session_pause(session_id: str = Form(...)):
+    print(f"[DEBUG] Session pause requested: {session_id}")
+    if session_id not in SESSION_TIMELINE:
+        print(f"[DEBUG] Invalid session ID: {session_id}")
+        print(f"[DEBUG] Available sessions: {list(SESSION_TIMELINE.keys())}")
+        return JSONResponse({"ok": False, "reason": "invalid session_id"}, status_code=400)
+
+    try:
+        # 세션을 일시 중단 상태로 설정 (데이터는 유지)
+        print(f"[DEBUG] Session paused: {session_id}")
+        return JSONResponse({"ok": True, "status": "paused"})
+    except Exception as e:
+        print(f"[DEBUG] Session pause error: {e}")
+        return JSONResponse({"ok": False, "reason": f"Session pause failed: {str(e)}"}, status_code=500)
+
 def _looks_like_webm_or_ogg(b: bytes) -> bool:
     if not b or len(b) < 16:
         return False

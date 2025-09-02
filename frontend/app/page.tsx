@@ -108,6 +108,9 @@ export default function RecorderApp() {
   const [transcript, setTranscript] = useState<string>("");
   const [downloadUrl, setDownloadUrl] = useState<string | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [sessionStatus, setSessionStatus] = useState<string>("Idle");
+  const [sessionActive, setSessionActive] = useState(false); // 세션이 활성 상태인지 확인
+  const [canResume, setCanResume] = useState(false); // 녹음 재개 가능한지 확인
 
   /** ---------- Live captions via SSE ---------- */
   const sseRef = useRef<EventSource | null>(null);
@@ -350,15 +353,43 @@ export default function RecorderApp() {
       try { await stopSession(sid); } catch (err: any) { setErrorMsg(err?.message || "Stop failed"); }
 
       sessionIdRef.current = null;
-      setSessionId(null);
       setRecording(false);
-      setStatusMsg("Stopped");
+      setSessionStatus("Idle");
+      setCanResume(true);
+      setRecording(false);
+      setStatusMsg("Recording paused - you can resume or export transcript");
     } catch (err: any) {
       console.error("[DEBUG] Stop recording error:", err);
       setErrorMsg(err?.message || "Stop failed");
     }
   }, [closeSSE, stopSession]);
 
+
+  const handleResume = useCallback(async () => {
+    if (!sessionId) return;
+
+    setRecording(true);
+    setCanResume(false);
+    // 기존 녹음 로직 재사용
+    // SSE 연결, MediaRecorder 시작 등
+  }, [sessionId]);
+
+
+  const handleCompleteSession = useCallback(async () => {
+    if (!sessionId) return;
+    
+    try {
+      await stopSession(sessionId);  // 백엔드에 세션 종료 요청
+      setSessionId(null);
+      setSessionActive(false);
+      setCanResume(false);
+      setStatusMsg("Session completed");
+    } catch (err: any) {
+      setErrorMsg(err?.message || "Session completion failed");
+    }
+  }, [sessionId, stopSession]);
+
+  
   /** ---------- Manual fetch/export ---------- */
   const fetchTranscript = useCallback(async () => {
     if (!sessionId) return;
@@ -415,7 +446,7 @@ export default function RecorderApp() {
               <Square className="mr-2 h-4 w-4" /> Stop Recording
             </Button>
             <Button variant="outline" onClick={fetchTranscript} disabled={!sessionId}>
-              <RefreshCw className="mr-2 h-4 w-4" /> Fetch Transcript
+              <RefreshCw className="mr-2 h-4 w-4" /> 시간대별로 보기
             </Button>
           </div>
 
@@ -452,7 +483,7 @@ export default function RecorderApp() {
           </div>
 
           <div className="flex flex-wrap gap-2 items-center">
-            <Button onClick={handleExport} disabled={!sessionId}>
+            <Button onClick={handleExport} disabled={!sessionId || recording}>
               <FileText className="mr-2 h-4 w-4" /> Export to Word
             </Button>
             {downloadUrl && (
