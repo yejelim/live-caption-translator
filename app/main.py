@@ -1,4 +1,5 @@
 # 1차리뷰 완료
+# 1차 품질검수 완료
 
 # 1) .env는 가장 먼저 로드
 from dotenv import load_dotenv
