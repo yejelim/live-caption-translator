@@ -1,0 +1,35 @@
+# Global ignores
+.git
+.gitignore
+**/.DS_Store
+node_modules
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-lock.yaml
+package-lock.json
+!frontend/pnpm-lock.yaml
+!frontend/package-lock.json
+!frontend/yarn.lock
+
+# Python caches
+__pycache__
+*.py[cod]
+*.pyo
+*.pyd
+*.whl
+*.egg-info
+.eggs
+.venv
+venv
+
+# Build outputs
+.next
+coverage
+.cache
+
+# App data
+/data
+
+# Secrets
+.env

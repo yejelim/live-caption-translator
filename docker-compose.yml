@@ -1,0 +1,37 @@
+version: "3.9"
+
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: backend.Dockerfile
+    image: live-caption-backend:latest
+    container_name: live-caption-backend
+    environment:
+      # Provide your OpenAI key here or via `docker compose --env-file`
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      # Optional model overrides
+      - ASR_MODEL=${ASR_MODEL:-whisper-1}
+      - LLM_MODEL=${LLM_MODEL:-gpt-4o-mini}
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: .
+      dockerfile: frontend.Dockerfile
+      args:
+        # Point Next.js to backend's URL inside/outside container
+        NEXT_PUBLIC_API_BASE_URL: ${NEXT_PUBLIC_API_BASE_URL:-http://localhost:8000}
+    image: live-caption-frontend:latest
+    container_name: live-caption-frontend
+    depends_on:
+      - backend
+    ports:
+      - "3000:3000"
+    environment:
+      - NODE_ENV=production
+    restart: unless-stopped
