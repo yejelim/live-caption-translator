@@ -1,7 +1,9 @@
 # ---------- deps ----------
 FROM node:20-bullseye-slim AS deps
 WORKDIR /app
-COPY package*.json ./
+COPY package.json ./
+COPY package-lock.json ./
+RUN ls -la
 RUN npm ci
 
 # ---------- builder ----------
