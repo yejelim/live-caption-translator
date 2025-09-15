@@ -39,6 +39,7 @@ app = FastAPI(title="Live Caption Translator", version="0.1.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
+        "http://live-caption-translator.vercel.app",  # Vercel 배포용 임시 조치
         "http://localhost:3000",
         "http://127.0.0.1:3000",
         "http://localhost:3001",
