@@ -35,26 +35,30 @@ from app.exporters import build_docx
 # ─────────────────────────────────────────────────────────────
 app = FastAPI(title="Live Caption Translator", version="0.1.0")
 
-# CORS: 개발에서 자주 쓰는 포트/도메인 허용
+# CORS: 배포 도메인(Vercel), 프리뷰 도메인, 로컬 허용
+# - Vercel 정식 배포: https://live-caption-translator.vercel.app
+# - Vercel 프리뷰: https://*.vercel.app (PR 등)
+# - 로컬 개발: http://localhost:포트
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-        "http://live-caption-translator.vercel.app",  # Vercel 배포용 임시 조치
+        "https://live-caption-translator.vercel.app",
         "http://localhost:3000",
         "http://127.0.0.1:3000",
         "http://localhost:3001",
         "http://127.0.0.1:3001",
         "http://localhost:3002",
         "http://127.0.0.1:3002",
-        "http://localhost:5173",  # Vite default
+        "http://localhost:5173",
         "http://127.0.0.1:5173",
-        "http://localhost:8080",  # Vue CLI default
+        "http://localhost:8080",
         "http://127.0.0.1:8080",
     ],
-    allow_origin_regex=r"http://localhost:\d+$",
-    allow_credentials=True,
+    allow_origin_regex=r"(^https:\/\/.*\.vercel\.app$)|(^http:\/\/localhost:\d+$)",
+    allow_credentials=False,            # 쿠키/세션 사용시 True로 바꿔야 함 (그땐 '*' 금지)
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["*"],
 )
 
 # ─────────────────────────────────────────────────────────────
@@ -366,9 +370,12 @@ def _looks_like_webm_or_ogg(b: bytes) -> bool:
     # Ogg: "OggS"
     if h == b"OggS":
         return True
-    if h4 == bytes([0x1F, 0x43, 0xB6, 0x75]):  # Opus in Ogg
+    # Matroska cluster magic (예: 1F 43 B6 75) 체크
+    h4 = b[:4]
+    if h4 == bytes([0x1F, 0x43, 0xB6, 0x75]):
         return True
-    if b.find(bytes([0x1A, 0x45, 0xDF, 0xA3]), 0, 64) != -1:  # EBML 헤더가 앞에 있는지
+    # 앞 64바이트 안에 EBML 헤더가 있는지
+    if b.find(bytes([0x1A, 0x45, 0xDF, 0xA3]), 0, 64) != -1:
         return True
     return False
 
@@ -381,8 +388,8 @@ async def http_upload_chunk(session_id: str = Form(...), blob: UploadFile = File
         return JSONResponse({"ok": False, "reason": "invalid session_id"}, status_code=400)
 
     # 파일 크기 검증
-    if not blob.file or blob.size is None or blob.size < 100:
-        print(f"[DEBUG] File too small: {blob.size} bytes")
+    if not blob.file or getattr(blob, "size", None) in (None, 0) or blob.size < 100:
+        print(f"[DEBUG] File too small: {getattr(blob, 'size', None)} bytes")
         return Response(status_code=204)
 
     # 파일 저장(선택)
