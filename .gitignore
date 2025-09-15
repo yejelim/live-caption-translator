@@ -206,3 +206,6 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# Vercel 배포용 임시 조치
+frontend/Dockerfile
