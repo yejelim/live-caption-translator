@@ -18,7 +18,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy backend source
 COPY app ./app
-COPY send_wav_ws.py ./send_wav_ws.py
 
 # Expose FastAPI port
 EXPOSE 8000
