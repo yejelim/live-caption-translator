@@ -617,7 +617,7 @@ export default function RecorderApp() {
         </CardContent>
 
         <CardFooter className="flex flex-col gap-2 text-xs text-muted-foreground">
-          <div>Tip: 이 버전은 3초마다 레코더를 재시작해 모든 청크를 ‘완전 파일(헤더 포함)’로 보냅니다.</div>
+          <div>Made with ❤️ by yeze at HealCode</div>
           {/* 선택 버튼: 세션 완전 종료 (정리/아카이브 용도) */}
           <div className="w-full flex items-center justify-end">
             <Button variant="ghost" className="text-xs" onClick={handleCompleteSession} disabled={!sessionIdRef.current && !sessionId}>
