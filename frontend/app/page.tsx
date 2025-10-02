@@ -519,7 +519,7 @@ export default function RecorderApp() {
         <CardHeader>
           <div className="flex items-center justify-between">
             <div>
-              <CardTitle className="text-2xl">Lab Meeting Recorder</CardTitle>
+              <CardTitle className="text-2xl">Live Caption Translator</CardTitle>
               <CardDescription>Start/Resume · Live captions · Export transcript</CardDescription>
             </div>
             <Badge variant={recording ? "default" : canResume ? "outline" : "secondary"}>
